@@ -1,0 +1,458 @@
+==============================================================================
+ YOXEL STORAGE MICROSERVICE — HIGH-LEVEL & LOW-LEVEL DESIGN
+==============================================================================
+
+This document describes:
+  A. The high-level architecture.
+  B. The type of storage used and why.
+  C. How files are saved and retrieved.
+  D. How other microservices communicate with this microservice.
+  E. The low-level (component / class / data) design.
+
+==============================================================================
+ A. HIGH-LEVEL DESIGN
+==============================================================================
+
+                +---------------------------+
+                |   Other Microservices     |
+                |  (orders, users, media,   |
+                |   reporting, etc.)        |
+                +-------------+-------------+
+                              |
+              REST + JSON, X-Api-Key per service
+                              |
+                              v
+                +-------------+-------------+
+                |  Storage Microservice API |     <-- stateless, autoscaled
+                |  (ASP.NET Core 8)         |
+                |                           |
+                |  - Auth (API key)         |
+                |  - Validation, quotas     |
+                |  - Presign issuer         |
+                |  - Range-enabled streamer |
+                +------+-------------+------+
+                       |             |
+                       |             |  publish events
+                       |             v
+                       |     +-------+--------+      +------------------+
+                       |     |   Event Bus    |----->| Async consumers: |
+                       |     |  (Kafka /      |      | - virus scanner  |
+                       |     |   RabbitMQ)    |      | - thumbnailer    |
+                       |     +----------------+      | - audit / DWH    |
+                       |                              +------------------+
+                       v
+        +--------------+----------------+       +---------------------------+
+        |       Metadata Database       |       |     Object Storage        |
+        |       (PostgreSQL)            |       |  (S3-compatible: AWS S3 / |
+        |                               |       |   MinIO / GCS / Ceph)     |
+        |  files                        |       |                           |
+        |   id, tenant, name,           |       |  bucket / tenant / guid / |
+        |   content_type, size,         |       |  filename                 |
+        |   sha256, storage_key,        |       |                           |
+        |   tags, created_*, deleted_*  |       |  AES-256 at rest, multi-  |
+        |                               |       |  AZ replication           |
+        +-------------------------------+       +---------------------------+
+
+KEY ARCHITECTURAL PROPERTIES
+----------------------------
+  * The API tier is stateless. Files do not live on the API pod's disk
+    (except as a transient SHA-256 buffer that is deleted on close).
+  * Metadata and bytes live in two different stores chosen for what each
+    is good at: an RDBMS for queryable, indexed records, and an object
+    store for cheap, durable blob storage.
+  * Bulk byte transfer can be offloaded to the object store directly via
+    presigned URLs, so the API tier is not a bandwidth bottleneck.
+
+==============================================================================
+ B. STORAGE TYPE AND JUSTIFICATION
+==============================================================================
+
+CHOSEN STORAGE: S3-COMPATIBLE OBJECT STORAGE
+--------------------------------------------
+  * Production: AWS S3 (or any S3-compatible service: GCS, Backblaze B2,
+    Cloudflare R2, Ceph RGW).
+  * Self-hosted / dev: MinIO (drop-in S3-compatible server, runs in a
+    container).
+  * Local-only / no-deps mode: a local-filesystem implementation is
+    included behind the same IFileStorage interface for development and
+    integration tests.
+
+WHY OBJECT STORAGE (and not a relational BLOB column or a network file
+share)?
+
+  1. PURPOSE-BUILT FOR UNSTRUCTURED BLOBS.
+     Object stores are designed for arbitrarily large, arbitrarily
+     typed binary payloads. RDBMS BLOB columns become operationally
+     painful at scale: backups balloon, replication lag spikes, vacuum
+     suffers, and a single hot row can stall the table.
+
+  2. EXTREME DURABILITY.
+     S3-class services advertise eleven nines (99.999999999%) of
+     durability, achieved through cross-AZ replication and erasure
+     coding. Reproducing that on a self-managed file share is costly.
+
+  3. ELASTIC, PETABYTE-SCALE CAPACITY.
+     Capacity grows transparently. There is no volume to resize, no
+     RAID to rebuild, no inode limit to plan around.
+
+  4. STATELESS COMPUTE.
+     Because bytes live in the object store and not on the API pods,
+     the API tier is fully stateless and horizontally scalable. Pods
+     can be added, removed, or rescheduled freely.
+
+  5. PRESIGNED URLS DECOUPLE THE BANDWIDTH PATH.
+     The API can hand a caller a short-lived signed URL pointing at the
+     object store. The caller then uploads or downloads directly from
+     the object store. The API tier is no longer a bytes-in-the-middle
+     proxy, which removes both a CPU and a bandwidth bottleneck.
+
+  6. PORTABLE PROTOCOL.
+     The S3 protocol is a de-facto standard; the same code runs against
+     AWS S3, MinIO, GCS, Cloudflare R2, etc. The service is not vendor
+     locked.
+
+  7. NATIVE LIFECYCLE PRIMITIVES.
+     Tiering hot -> warm -> cold, expiration, and versioning are first-
+     class features of the backend; the service can offload these
+     concerns to bucket policies.
+
+A relational database is still the right tool for the *metadata* (small,
+queryable, transactional, indexed). The design uses both: PostgreSQL for
+metadata, S3 for bytes.
+
+==============================================================================
+ C. HOW FILES ARE SAVED AND RETRIEVED
+==============================================================================
+
+C.1  SAVE FLOW (server-streamed upload)
+---------------------------------------
+                    client (other microservice)
+                              |
+        POST /api/v1/files (multipart/form-data, X-Api-Key)
+                              v
+                    +---------+---------+
+                    |  FilesController   |
+                    +---------+---------+
+                              |
+                              v
+                    +---------+---------+      Auth: API key -> tenant
+                    |   StorageService   |
+                    +---------+---------+
+                              |
+       1. Buffer body to a temp file (DeleteOnClose)
+       2. Compute SHA-256 + size in a single pass over the temp file
+       3. Build storage key:  {tenant}/{guid:N}/{safe-filename}
+                              |
+                              v
+                    +---------+---------+
+                    |   IFileStorage     |  (S3FileStorage or LocalFileStorage)
+                    +---------+---------+
+                              |
+                              v
+                    +---------+---------+
+                    | Object store (S3) |  PutObject, server-side AES-256
+                    +-------------------+
+                              |
+       4. Insert FileMetadata row (Postgres, transactional)
+       5. Publish "storage.file.uploaded" event (event bus)
+       6. Return 201 Created, Location: /api/v1/files/{id}, body = metadata
+
+WHY BUFFER TO A TEMP FILE FIRST?
+    The upload stream is forward-only and must be read TWICE: once to
+    compute the SHA-256 (so we can record an integrity checksum and
+    enable dedup) and once to push to the backend. A temp file with
+    FileOptions.DeleteOnClose is the simplest correct way; it never
+    fills RAM and is removed automatically when the FileStream is
+    disposed.
+
+C.2  ALTERNATE SAVE FLOW (presigned PUT — for very large files)
+---------------------------------------------------------------
+    1. Client: POST /api/v1/files/init  -> server returns a presigned PUT
+       URL valid for N minutes plus a pending FileMetadata id.
+    2. Client uploads bytes directly to the object store via the URL.
+    3. Client: POST /api/v1/files/{id}/complete -> server HEADs the
+       object, fills in size/sha256/contentType, marks the row Active,
+       and emits the upload event.
+    This path is documented for completeness; the v1 implementation
+    ships only the server-streamed flow.
+
+C.3  RETRIEVE FLOW
+------------------
+
+    GET /api/v1/files/{id}                 -> stream bytes (range-enabled)
+        - Loads FileMetadata by id (tenant-scoped).
+        - Opens IFileStorage.OpenReadAsync(storageKey).
+        - Returns a streamed FileStreamResult with
+          enableRangeProcessing: true, so HTTP Range requests are
+          honored (resume, video seek).
+
+    GET /api/v1/files/{id}/metadata        -> JSON metadata only
+        - Cheap; never touches the object store.
+
+    GET /api/v1/files?skip=&take=          -> paginated list (per tenant)
+        - Tenant scope is enforced server-side from the API key, so a
+          caller cannot list another tenant's files even by guessing.
+
+    GET /api/v1/files/{id}/url?validitySeconds=900
+        -> issue a presigned download URL
+        - Backend must support presigning (S3 yes, Local FS returns a
+          friendly 404 with "presigned URLs not supported by the current
+          backend").
+
+    DELETE /api/v1/files/{id}              -> soft delete
+        - Sets DeletedAt; row remains queryable for the retention
+          window. A separate cleanup worker hard-deletes object + row
+          when the window expires. Soft delete makes accidental
+          deletions recoverable.
+
+C.4  STORAGE KEY LAYOUT
+-----------------------
+    {tenant}/{guid:N}/{safe-filename}
+
+    e.g.  service-a/8a3b9f0e2c4d4f12bf83a17e0d22a4c1/invoice.pdf
+
+  * Tenant prefix enables IAM policies and lifecycle rules at the
+    bucket-prefix level.
+  * GUID guarantees uniqueness even when two callers upload the same
+    filename.
+  * Original filename is preserved (sanitized) so range downloads can
+    surface a sensible Content-Disposition.
+
+==============================================================================
+ D. HOW OTHER MICROSERVICES COMMUNICATE WITH THIS ONE
+==============================================================================
+
+D.1  TWO COMMUNICATION CHANNELS
+-------------------------------
+
+  (1) SYNCHRONOUS  -- REST over HTTPS  (request/response)
+      Used when the caller needs an immediate answer: upload, download,
+      get metadata, list, delete, mint a presigned URL.
+
+  (2) ASYNCHRONOUS -- Event bus messages  (fire-and-forget, fan-out)
+      Used to notify *any* number of interested microservices about a
+      lifecycle change without coupling the storage service to them.
+
+D.2  SYNCHRONOUS PROTOCOL (REST + JSON)
+---------------------------------------
+  * Transport     : HTTPS (TLS 1.2+).
+  * Encoding      : application/json for metadata; multipart/form-data
+                    for upload; raw bytes (any Content-Type) for
+                    download; text/event-stream is NOT used.
+  * Versioning    : URL-prefixed -- /api/v1/...
+  * Auth          : X-Api-Key header. The key identifies a single
+                    calling microservice and resolves to exactly one
+                    tenant. API keys are stored hashed in production
+                    and revocable without redeploy.
+  * Idempotency   : Clients may include an X-Idempotency-Key header on
+                    upload; replays within the configured window return
+                    the original metadata response.
+  * Errors        : RFC 7807 problem+json bodies; standard HTTP codes
+                    (201 created, 200 ok, 204 deleted, 400 bad request,
+                    401/403 auth, 404 not found, 409 conflict, 413
+                    payload too large, 429 throttled, 5xx server).
+
+  Endpoint summary:
+    POST   /api/v1/files                           upload
+    GET    /api/v1/files                           list (tenant-scoped)
+    GET    /api/v1/files/{id}                      download (range)
+    GET    /api/v1/files/{id}/metadata             metadata only
+    GET    /api/v1/files/{id}/url?validitySeconds  presigned URL
+    DELETE /api/v1/files/{id}                      soft delete
+    GET    /health, /ready                         ops endpoints
+
+D.3  ASYNCHRONOUS PROTOCOL (event bus)
+--------------------------------------
+  * Transport : Kafka (preferred) or RabbitMQ; abstracted behind
+                IStorageEventPublisher so the choice is configurable.
+  * Topic     : storage.events
+  * Format    : CloudEvents 1.0 envelope, JSON-serialized.
+
+  Event types emitted by the storage service:
+    storage.file.uploaded   -- a new file was successfully stored.
+    storage.file.deleted    -- a file was (soft) deleted.
+    storage.file.scanned    -- AV scan worker reported a result;
+                               metadata.ScanStatus is updated.
+
+  Typical consumers:
+    - Virus scanner worker  -> downloads the file, scans, publishes
+                               storage.file.scanned with verdict.
+    - Thumbnail worker      -> for image / video / PDF inputs, generates
+                               thumbnails and stores them back via the
+                               same upload API.
+    - Audit / DWH           -> writes an immutable audit log of every
+                               lifecycle change.
+
+  This pattern lets new consumers be added without changing the
+  storage service: the storage service knows nothing about who is
+  listening.
+
+D.4  TYPICAL CALL EXAMPLES (curl, X-Api-Key elided for brevity)
+--------------------------------------------------------------
+    # upload
+    curl -F "file=@invoice.pdf" -F "description=April invoice" \
+         https://storage.yoxel.local/api/v1/files
+
+    # metadata
+    curl https://storage.yoxel.local/api/v1/files/8a3b9f0e.../metadata
+
+    # download (with range)
+    curl -H "Range: bytes=0-1023" \
+         https://storage.yoxel.local/api/v1/files/8a3b9f0e... -o head.bin
+
+    # presigned URL (S3 backend)
+    curl https://storage.yoxel.local/api/v1/files/8a3b9f0e.../url?validitySeconds=900
+    # -> { "url": "https://s3.amazonaws.com/...?X-Amz-Signature=..." }
+
+D.5  CLIENT LIBRARY (recommendation, not part of v1 code)
+---------------------------------------------------------
+  Other Yoxel microservices should consume the API via a thin shared
+  HttpClient wrapper (Yoxel.Storage.Client) that:
+    - injects the X-Api-Key,
+    - propagates the W3C trace context header,
+    - handles retries with exponential backoff,
+    - exposes a typed Upload/Download/GetMetadata/Delete surface.
+  This is described here so callers know what "good" looks like; the
+  v1 deliverable is the service itself.
+
+==============================================================================
+ E. LOW-LEVEL DESIGN  (components, classes, data)
+==============================================================================
+
+E.1  PROJECT LAYOUT  (Clean / Onion architecture)
+
+    Yoxel.Storage.sln
+    +-- src/
+        +-- Yoxel.Storage.Core              (domain + application layer)
+        |     |
+        |     +-- Models/
+        |     |     +-- FileMetadata
+        |     |     +-- StoredFile
+        |     +-- Abstractions/
+        |     |     +-- IFileStorage
+        |     |     +-- IFileMetadataRepository
+        |     |     +-- IStorageService
+        |     |     +-- IStorageEventPublisher
+        |     +-- Services/
+        |     |     +-- StorageService          (orchestration)
+        |     +-- Exceptions/
+        |           +-- StorageFileNotFoundException
+        |
+        +-- Yoxel.Storage.Infrastructure    (concrete adapters)
+        |     |
+        |     +-- Storage/
+        |     |     +-- LocalFileStorage        (filesystem backend)
+        |     |     +-- S3FileStorage           (S3-compatible backend)
+        |     +-- Persistence/
+        |     |     +-- StorageDbContext        (EF Core)
+        |     |     +-- EfFileMetadataRepository
+        |     +-- Events/
+        |     |     +-- NoopStorageEventPublisher (logs only; replace in prod)
+        |     +-- DependencyInjection           (composition root)
+        |
+        +-- Yoxel.Storage.Api                (HTTP / hosting layer)
+              |
+              +-- Controllers/
+              |     +-- FilesController
+              +-- Authentication/
+              |     +-- ApiKeyOptions
+              |     +-- ApiKeyAuthHandler
+              +-- Middleware/
+              |     +-- ExceptionMiddleware     (problem+json mapping)
+              +-- Program.cs                    (composition + middleware)
+              +-- appsettings.json
+
+  Dependency direction:  Api  ->  Infrastructure  ->  Core
+  Core depends on nothing but BCL + logging abstractions, so it is
+  trivially unit-testable and free to swap backends.
+
+E.2  DOMAIN MODEL
+
+    FileMetadata
+        Id            : Guid                (primary key)
+        TenantId      : string              (indexed; resolved from API key)
+        FileName      : string              (max 512 chars; sanitized)
+        ContentType   : string              (max 255; defaults to
+                                             application/octet-stream)
+        SizeBytes     : long
+        Sha256        : string              (64 hex chars, indexed)
+        StorageKey    : string              (max 1024; the backend key)
+        Description   : string?             (optional)
+        Tags          : Dictionary<string,string> (JSON column in Postgres)
+        CreatedBy     : string              (API key holder name)
+        CreatedAt     : DateTimeOffset
+        DeletedAt     : DateTimeOffset?     (soft delete)
+
+E.3  ABSTRACTIONS  (the seams)
+
+    IFileStorage
+        SaveAsync(storageKey, stream, contentType)              -> string
+        OpenReadAsync(storageKey)                               -> Stream
+        DeleteAsync(storageKey)                                 -> void
+        ExistsAsync(storageKey)                                 -> bool
+        GetPresignedDownloadUrlAsync(storageKey, validity)      -> Uri?
+
+    IFileMetadataRepository
+        AddAsync, GetAsync, ListAsync, UpdateAsync, DeleteAsync (soft)
+
+    IStorageEventPublisher
+        PublishAsync(eventName, payload)                        -> void
+
+    IStorageService                       (the application-layer entry point)
+        UploadAsync, DownloadAsync, GetMetadataAsync,
+        ListAsync, DeleteAsync, GetDownloadUrlAsync
+
+E.4  STORAGESERVICE  (orchestration, in Core)
+
+    Inputs:  IFileStorage, IFileMetadataRepository,
+             IStorageEventPublisher, ILogger
+    UploadAsync:
+       - Buffer to temp file (DeleteOnClose).
+       - Compute SHA-256 + size.
+       - storageKey = "{tenant}/{guid:N}/{safe-filename}".
+       - IFileStorage.SaveAsync(...).
+       - IFileMetadataRepository.AddAsync(...).
+       - IStorageEventPublisher.PublishAsync("storage.file.uploaded", ...).
+       - return FileMetadata.
+    DownloadAsync:
+       - Repository.GetAsync(id) -> 404 if null or deleted.
+       - IFileStorage.OpenReadAsync -> StoredFile (stream + name + ct).
+
+E.5  HTTP API  (FilesController)
+
+    All endpoints are [Authorize] under the ApiKey scheme. Tenant is
+    extracted from the authenticated principal's "tenant" claim; the
+    controller never trusts a client-supplied tenant.
+
+E.6  SECURITY DETAILS
+    - X-Api-Key validated by ApiKeyAuthHandler against a config-bound
+      dictionary {key -> {tenantId, name}}.
+    - In production the handler would be backed by a hashed secret store
+      (Vault / AWS Secrets Manager); the in-memory dict is the default
+      for dev/test.
+    - Storage keys are normalised through Path.GetFullPath and asserted
+      to remain inside the configured root, so a tenant cannot escape
+      its own prefix.
+    - Multipart upload limit is 5 GB by default (configurable).
+    - All endpoints require authentication; no anonymous access.
+
+E.7  PERSISTENCE DETAILS
+    - EF Core 8 + Npgsql.
+    - Tags stored as a JSON column with a value-conversion to
+      Dictionary<string,string>.
+    - Indexes on TenantId and Sha256 (the dedup probe).
+    - Soft delete: queries filter out DeletedAt != null.
+
+E.8  EVENT BUS DETAILS
+    - Default IStorageEventPublisher is a no-op that logs. In
+      production it is replaced by Confluent.Kafka or
+      RabbitMQ.Client based publisher; the StorageService never knows.
+
+E.9  DEPLOYMENT TOPOLOGY
+    - Container image built from the included Dockerfile (multi-stage,
+      net8.0 SDK -> aspnet runtime).
+    - docker-compose.yml provides Postgres + MinIO + the API for
+      local end-to-end development.
+    - In production: API runs as N replicas behind a load balancer;
+      Postgres is managed (RDS / Cloud SQL); object store is the cloud
+      provider's S3.

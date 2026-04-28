@@ -1,0 +1,158 @@
+==============================================================================
+ YOXEL STORAGE MICROSERVICE — REQUIREMENTS
+==============================================================================
+
+PURPOSE
+-------
+A centralized storage microservice that acts as the single file/object
+storage hub for every other microservice in the Yoxel platform. It accepts
+files of any extension and any content type, persists them durably, and
+exposes APIs for upload, download, listing, and lifecycle management.
+
+==============================================================================
+ 1. FUNCTIONAL REQUIREMENTS  (what the service must DO)
+==============================================================================
+
+1.1  FILE OPERATIONS
+    FR-1.1   Upload a file of any extension/MIME type via multipart/form-data.
+    FR-1.2   Download a file by its identifier; support HTTP byte-range
+             requests (partial downloads, video seek, resume).
+    FR-1.3   Delete a file (soft delete by default; hard delete via cleanup
+             worker after a retention window).
+    FR-1.4   Replace / overwrite an existing file (creates a new version when
+             versioning is enabled).
+    FR-1.5   Compute and store an integrity checksum (SHA-256) on every
+             upload so callers can verify content hasn't been corrupted.
+
+1.2  METADATA AND DISCOVERY
+    FR-2.1   Persist metadata for every stored file: id, tenant, original
+             filename, MIME type, size in bytes, SHA-256, storage key,
+             optional description, free-form tags (key/value), creator
+             identity, created/deleted timestamps.
+    FR-2.2   Fetch metadata only (without transferring the file body).
+    FR-2.3   List files scoped to the calling service's tenant, paginated.
+    FR-2.4   Filter / search by tag, MIME type, filename prefix, and time
+             range.
+
+1.3  ACCESS AND INTEGRATION
+    FR-3.1   Authenticate every request using a per-microservice API key
+             (X-Api-Key header). Each key is bound to exactly one tenant.
+    FR-3.2   Issue short-lived presigned URLs so clients can upload to or
+             download from the underlying object store directly, without
+             proxying bytes through the service (S3-compatible backend only).
+    FR-3.3   Emit asynchronous events on file lifecycle changes
+             (file.uploaded, file.deleted, file.scanned) onto an event bus
+             so consumers (thumbnailer, virus scanner, audit, analytics)
+             can react out-of-band.
+
+1.4  MULTI-TENANCY
+    FR-4.1   Logically isolate data per tenant. A microservice may only
+             read, list, or delete files belonging to its own tenant.
+    FR-4.2   Enforce a per-tenant storage quota (configurable).
+
+1.5  LIFECYCLE
+    FR-5.1   Support soft delete (DeletedAt timestamp) with a configurable
+             retention window before hard delete.
+    FR-5.2   Support optional storage-class tiering (hot -> warm -> cold)
+             driven by age or access frequency (delegated to the backend's
+             lifecycle rules).
+    FR-5.3   Optional content deduplication: if two uploads share the same
+             SHA-256 within the same tenant, store the bytes once and
+             reference-count.
+
+1.6  CONTENT SAFETY (delegated to async workers)
+    FR-6.1   Run an antivirus / malware scan on every newly uploaded file
+             via an async consumer of the file.uploaded event. The
+             metadata record carries a ScanStatus (Pending/Clean/Infected)
+             so callers can choose to gate downloads on a Clean status.
+
+1.7  OBSERVABILITY AND OPERATIONS
+    FR-7.1   Expose /health (liveness) and /ready (readiness) endpoints.
+    FR-7.2   Expose Prometheus metrics (request rate, errors, durations,
+             upload/download bytes, queue depth).
+    FR-7.3   Emit structured logs and OpenTelemetry traces for every
+             request, correlated to a request id.
+    FR-7.4   Provide an OpenAPI (Swagger) document for all endpoints.
+
+==============================================================================
+ 2. NON-FUNCTIONAL REQUIREMENTS  (how WELL the service must do it)
+==============================================================================
+
+2.1  DURABILITY
+    NFR-1.1  >= 99.999999999% (11 nines) durability for stored objects.
+             Achieved by using an S3-compatible object store with cross-AZ
+             replication and erasure coding. Metadata DB runs with
+             synchronous replication and daily backups.
+
+2.2  AVAILABILITY
+    NFR-2.1  >= 99.95% monthly availability for the API tier.
+    NFR-2.2  Multi-AZ deployment; the API is stateless behind a load
+             balancer so any pod can serve any request.
+
+2.3  SCALABILITY
+    NFR-3.1  Horizontal scale-out of the API tier (no sticky sessions,
+             no in-process state).
+    NFR-3.2  Object store scales independently to PB-class capacity.
+    NFR-3.3  Metadata DB is shardable by tenant id.
+    NFR-3.4  Throughput target: >= 1000 concurrent uploads/downloads per
+             API pod, limited primarily by network rather than CPU
+             (achieved by handing out presigned URLs for the bulk path).
+
+2.4  PERFORMANCE
+    NFR-4.1  p95 metadata read  < 50  ms.
+    NFR-4.2  p95 metadata write < 100 ms.
+    NFR-4.3  Upload / download throughput limited only by client and
+             backend bandwidth (the service itself does not buffer the
+             whole file in memory).
+
+2.5  SECURITY
+    NFR-5.1  TLS 1.2+ in transit for every endpoint.
+    NFR-5.2  AES-256 encryption at rest (server-side encryption on the
+             object store; KMS-managed keys per tenant when required).
+    NFR-5.3  Per-microservice API keys scoped to a tenant; revocable
+             without code changes.
+    NFR-5.4  Path-traversal-safe storage keys (no "../" escape from the
+             tenant root).
+    NFR-5.5  Rate limiting per API key.
+    NFR-5.6  Audit log of every read, write, and delete (immutable, with
+             actor, target, and timestamp).
+
+2.6  CONSISTENCY
+    NFR-6.1  Strong consistency on metadata operations (RDBMS
+             transactions).
+    NFR-6.2  Read-after-write consistency on the object store (S3-class
+             guarantees).
+
+2.7  RELIABILITY
+    NFR-7.1  Idempotent upload (client may supply a request id; replays
+             return the original metadata instead of duplicating bytes).
+    NFR-7.2  Retries with exponential backoff for transient backend
+             failures; circuit breakers to fail fast under sustained
+             outage.
+    NFR-7.3  Graceful shutdown: in-flight requests drain before the pod
+             exits.
+
+2.8  COST EFFICIENCY
+    NFR-8.1  Storage-class tiering moves cold data to cheaper tiers
+             automatically.
+    NFR-8.2  Optional deduplication reduces footprint when callers share
+             content.
+    NFR-8.3  No bandwidth proxying for the bulk upload/download path
+             (presigned URLs).
+
+2.9  COMPLIANCE
+    NFR-9.1  GDPR-style "delete by data subject" supported via tenant +
+             tag filters that can hard-delete matching objects.
+    NFR-9.2  Configurable data residency per tenant (region pinning of
+             the underlying bucket).
+    NFR-9.3  Retention windows are policy-configurable, not hard-coded.
+
+2.10 MAINTAINABILITY AND PORTABILITY
+    NFR-10.1 Clean separation of API / domain / infrastructure layers so
+             backends can be swapped without changing business code.
+    NFR-10.2 Pluggable storage backend behind IFileStorage (Local FS for
+             dev, S3 / MinIO / GCS for production).
+    NFR-10.3 Pluggable event publisher behind IStorageEventPublisher
+             (no-op for dev, Kafka / RabbitMQ in production).
+    NFR-10.4 Versioned REST API (/api/v1/...) with backward-compatible
+             changes within a major version.

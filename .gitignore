@@ -1,0 +1,28 @@
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Publish output
+publish/
+out/
+
+# Rider / VS / VS Code
+.idea/
+.vs/
+.vscode/
+
+# Local data
+data/
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log

@@ -1,0 +1,14 @@
+**/bin
+**/obj
+**/.vs
+**/.vscode
+**/.idea
+**/*.user
+**/data
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+descrition.txt
+hld.txt
